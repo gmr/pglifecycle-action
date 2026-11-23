@@ -102,7 +102,9 @@ jobs:
         with:
           version: ${{ env.PGL_VERSION }}
           project: ./schema
-          comment-on-pr: ${{ github.event_name == 'pull_request' }}
+          # A fork's token cannot write comments, so test the comment
+          # only for a pull request from this repository.
+          comment-on-pr: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
           host: localhost
           username: postgres
           password: postgres
