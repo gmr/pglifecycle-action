@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  PGL_VERSION: 2.0.0-beta.4
+
 jobs:
   shellcheck:
     runs-on: ubuntu-latest
@@ -22,15 +25,27 @@ jobs:
       - id: setup
         uses: ./
         with:
-          version: 2.0.0-alpha.1
+          version: ${{ env.PGL_VERSION }}
       - name: The binary runs and reports the requested version
         run: |
           pglifecycle --version
-          test "$(pglifecycle --version)" = "pglifecycle 2.0.0-alpha.1"
-          test "${{ steps.setup.outputs.version }}" = "2.0.0-alpha.1"
+          test "$(pglifecycle --version)" = "pglifecycle ${PGL_VERSION}"
+          test "${{ steps.setup.outputs.version }}" = "${PGL_VERSION}"
+      - id: latest
+        uses: ./
+      - name: latest installs a release that runs
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          BINARY: ${{ steps.latest.outputs.path }}
+        run: |
+          test -n "$VERSION"
+          test "$("$BINARY" --version)" = "pglifecycle $VERSION"
 
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     services:
       postgres:
         image: postgres:18
@@ -47,45 +62,66 @@ jobs:
       PGDATABASE: postgres
     steps:
       - uses: actions/checkout@v5
-      # The runner ships PostgreSQL 16 client tools and pg_dump refuses to
-      # read a newer server, so install the 18 client and put it first on
-      # PATH. The PGDG repository is already configured on the image.
+      # The runner ships older PostgreSQL client tools and pg_dump refuses
+      # to read a newer server, so add the PGDG repository and put the 18
+      # client first on PATH.
       - name: Install the PostgreSQL 18 client
         run: |
-          sudo apt-get update
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y postgresql-client-18
           echo /usr/lib/postgresql/18/bin >> "$GITHUB_PATH"
       - uses: ./
         with:
-          version: 2.0.0-alpha.1
+          version: ${{ env.PGL_VERSION }}
       - name: pg_dump matches the server major version
-        run: pg_dump --version
-      - name: Create a skeleton project
-        run: pglifecycle create ./schema
+        run: pg_dump --version | grep -q ' 18\.'
+      - name: Create a schema
+        run: |
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE app_read NOLOGIN;
+          CREATE SCHEMA app;
+          CREATE TABLE app.account (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            email text NOT NULL UNIQUE,
+            created_at timestamptz NOT NULL DEFAULT now());
+          CREATE INDEX account_created_at ON app.account (created_at);
+          CREATE VIEW app.recent AS
+            SELECT id, email FROM app.account
+             WHERE created_at > now() - interval '1 day';
+          CREATE FUNCTION app.normalize(text) RETURNS text
+            LANGUAGE sql IMMUTABLE AS $$ SELECT lower(trim($1)) $$;
+          GRANT USAGE ON SCHEMA app TO app_read;
+          GRANT SELECT ON ALL TABLES IN SCHEMA app TO app_read;
+          SQL
+      - name: Pull the database into a project
+        run: pglifecycle pull ./schema
 
+      # A project that pull wrote gives an empty plan for its database.
       - id: plan
         uses: ./deploy
         with:
-          version: 2.0.0-alpha.1
+          version: ${{ env.PGL_VERSION }}
           project: ./schema
+          comment-on-pr: ${{ github.event_name == 'pull_request' }}
           host: localhost
           username: postgres
           password: postgres
           database: postgres
-      - name: The plan was written and the outputs are set
+      - name: The plan is empty and the outputs are set
         run: |
           head -1 "${{ steps.plan.outputs.plan }}" | grep -q '^-- pglifecycle deploy$'
-          case "${{ steps.plan.outputs.drift }}" in true|false) ;; *) exit 1 ;; esac
+          test "${{ steps.plan.outputs.drift }}" = false
+          test "${{ steps.plan.outputs.excluded }}" = 0
 
       # An object that exists only in the database is a change, and
       # dropping it is destructive, so this plan always reports drift.
       - name: Drift the database
-        run: psql -c 'CREATE TABLE drifted (id int)'
+        run: psql -c 'CREATE TABLE app.drifted (id int)'
       - id: drifted
         continue-on-error: true
         uses: ./deploy
         with:
-          version: 2.0.0-alpha.1
+          version: ${{ env.PGL_VERSION }}
           project: ./schema
           output: drifted.sql
           fail-on-drift: true
@@ -97,3 +133,4 @@ jobs:
         run: |
           test "${{ steps.drifted.outcome }}" = failure
           test "${{ steps.drifted.outputs.drift }}" = true
+          test "${{ steps.drifted.outputs.excluded }}" = 1
